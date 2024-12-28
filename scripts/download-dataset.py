@@ -53,3 +53,8 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+    # python download-dataset.py --name tecnick        --datasets_root /home/yichi/Project/dataset
+                                        #   clic2022-test
+                                        #   tecnick
+                                        # kodak 

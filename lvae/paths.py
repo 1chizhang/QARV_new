@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 # The root directory of all datasets
-_root = (Path(__file__).parent / '../../../datasets').resolve()
+_root = (Path(__file__).parent / '../../dataset').resolve()
 
 known_datasets = {
     # Kodak images: http://r0k.us/graphics/kodak
@@ -18,8 +18,8 @@ known_datasets = {
     'tecnick-rgb-1200': _root / 'tecnick/TESTIMAGES/RGB/RGB_OR_1200x1200',
 
     # COCO dataset: http://cocodataset.org
-    'coco-train2017': _root / 'coco/train2017',
-    'coco-val2017':   _root / 'coco/val2017',
+    'coco-train2017': _root / 'train2017',
+    'coco-val2017':   _root / 'val2017',
 
     # ImageNet dataset: http://www.image-net.org
     'imagenet-train': _root / 'imagenet/train',

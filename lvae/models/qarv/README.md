@@ -71,6 +71,11 @@ CUDA_VISIBLE_DEVICES=2 python train-var-rate.py --model qarv_base --batch_size 3
 CUDA_VISIBLE_DEVICES=4,5 torchrun --nproc_per_node 2 train-var-rate.py --model qarv_base --batch_size 16 --iterations 2_000_000 --workers 8 --wbmode online
 ```
 
+CUDA_VISIBLE_DEVICES=0 python train-var-rate.py --model qarv_base --batch_size 32 --iterations 2_000_000 --workers 8 --wbmode disabled --name QARV_bf16_test_GPU  --compile --bf16
+
+CUDA_VISIBLE_DEVICES=1,0 torchrun --nproc_per_node 2 train-var-rate.py --model qarv_base --batch_size 16 --iterations 2_000_000 --workers 8 --wbmode online --name QARV_bf16 --compile --bf16 --resume QARV_bf16
+
+
 
 ## Citation
 ```

@@ -9,17 +9,19 @@ from lvae.paths import known_datasets
 from lvae.trainer import BaseTrainingWrapper
 from lvae.datasets import get_image_dateset, make_trainloader
 
+# import torch._dynamo
+# torch._dynamo.config.suppress_errors = True
 
 def parse_args():
     # ====== set the run settings ======
     parser = argparse.ArgumentParser()
     # wandb setting
-    parser.add_argument('--wbproject',  type=str,  default='default')
-    parser.add_argument('--wbentity',   type=str,  default=None)
-    parser.add_argument('--wbgroup',    type=str,  default='var-rate-exp')
+    parser.add_argument('--wbproject',  type=str,  default='QARV_side')
+    parser.add_argument('--wbentity',   type=str,  default='yichizhang')
+    parser.add_argument('--wbgroup',    type=str,  default='independent_mapping')
     parser.add_argument('--wbtags',     type=str,  default=None, nargs='+')
     parser.add_argument('--wbnote',     type=str,  default=None)
-    parser.add_argument('--wbmode',     type=str,  default='disabled')
+    parser.add_argument('--wbmode',     type=str,  default='online')
     parser.add_argument('--name',       type=str,  default=None)
     # model setting
     parser.add_argument('--model',      type=str,  default='qarv_base')
@@ -48,7 +50,12 @@ def parse_args():
     # exponential moving averaging (EMA)
     parser.add_argument('--ema',        action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--ema_decay',  type=float,default=0.9999)
-    parser.add_argument('--ema_warmup', type=int,  default=10_000)
+    # compile
+    parser.add_argument('--compile',    action=argparse.BooleanOptionalAction, default=False)
+    # amp setting
+    parser.add_argument('--amp',        action=argparse.BooleanOptionalAction, default=False)
+    # enable bf16
+    parser.add_argument('--bf16',       action=argparse.BooleanOptionalAction, default=False)
     # device setting
     parser.add_argument('--fixseed',    action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--workers',    type=int,  default=6)
@@ -56,7 +63,6 @@ def parse_args():
 
     # default settings
     cfg.wdecay = 0.0
-    cfg.amp = False
     cfg.wandb_log_interval = 100
     cfg.model_log_interval = 2000
     cfg.model_val_interval = 2000
@@ -97,12 +103,14 @@ class TrainWrapper(BaseTrainingWrapper):
         checkpoint = {
             'model'     : model_.state_dict(),
             'optimizer' : self.optimizer.state_dict(),
-            'scaler'    : self.scaler.state_dict(),
+            # 'scaler'    : self.scaler.state_dict(),
             # loop_name   : loop_step,
             'epoch': self._cur_epoch,
             'iter':  self._cur_iter,
             'results'   : results,
         }
+        if self.scaler is not None:
+            checkpoint['scaler'] = self.scaler.state_dict()
         torch.save(checkpoint, log_dir / 'last.pt')
         self._save_if_best(checkpoint)
 

@@ -7,11 +7,11 @@ import logging
 import math
 import torch
 import torch.distributed
-import torch.cuda.amp as amp
+import torch.amp as amp
 import torchvision as tv
 import wandb
 from torch.nn.parallel import DistributedDataParallel as DDP
-from timm.utils import ModelEmaV2, unwrap_model, random_seed
+from timm.utils import ModelEmaV3, unwrap_model, random_seed
 
 import lvae.utils as utils
 from lvae.datasets.loader import make_trainloader
@@ -124,7 +124,27 @@ class BaseTrainingWrapper():
 
     def prepare_configs(self):
         cfg = self.cfg
+        # Check precision settings
+        if cfg.bf16 and cfg.amp:
+            logging.warning("Both bf16 and amp are enabled, will use bf16 as it takes precedence")
+            cfg.amp = False  # bf16 has higher priority
+        if cfg.bf16:
+            device_capability = torch.cuda.get_device_capability()
+            if device_capability[0] < 8:  # Ampere and above architectures support bf16
+                logging.warning(f"Device capability {device_capability} may not support bf16. Falling back to fp32")
+                cfg.bf16 = False
+                cfg.amp_dtype = None
+            else:
+                cfg.amp_dtype = torch.bfloat16
+                logging.info('Using bfloat16 mixed precision training')
+        elif cfg.amp:
+            cfg.amp_dtype = torch.float16
+            logging.info('Using float16 mixed precision training')
+        else:
+            cfg.amp_dtype = None
+            logging.info('Using full precision training')
 
+        
         if cfg.fixseed: # fix random seeds for reproducibility
             random_seed(2 + self.local_rank)
         torch.backends.cudnn.benchmark = True
@@ -172,6 +192,11 @@ class BaseTrainingWrapper():
             utils.print_to_file(str(model), fpath=self._log_dir / 'model.txt', mode='w')
 
         self.model = model.to(self.device)
+        #compile
+        if cfg.compile:
+            self.model = torch.compile(self.model)
+            logging.info('Model compiled. \n')
+
 
     def set_optimizer(self):
         cfg, model = self.cfg, self.model
@@ -220,7 +245,18 @@ class BaseTrainingWrapper():
             raise ValueError(f'Unknown optimizer: {cfg.optimizer}')
 
         self.optimizer = optimizer
-        self.scaler = amp.GradScaler(enabled=cfg.amp) # Automatic mixed precision
+        # Configure gradient scaler
+        if cfg.amp_dtype is not None:
+            # Both bf16 and fp16 can benefit from gradient scaling
+            scale_args = {
+                "init_scale": 2.**16 if cfg.amp_dtype == torch.float16 else 2.**7,
+                "growth_factor": 2.0 if cfg.amp_dtype == torch.float16 else 1.5,
+                "backoff_factor": 0.5,
+                "growth_interval": 100
+            }
+            self.scaler = amp.GradScaler(**scale_args)
+        else:
+            self.scaler = None
 
     @staticmethod
     def get_cosine_factor(t, T, final=0.01):
@@ -254,48 +290,91 @@ class BaseTrainingWrapper():
     def set_pretrain(self):
         cfg = self.cfg
 
-        if cfg.resume is not None: # resume
+        if cfg.resume is not None:
             assert not cfg.weights, f'--resume={cfg.resume} not compatible with --weights={cfg.weights}'
             ckpt_path = self._log_dir / 'last.pt'
             checkpoint = torch.load(ckpt_path, map_location='cpu')
-            self.model.load_state_dict(checkpoint['model'])
+            
+            # Load model and optimizer states
+            unwrap_model(self.model).load_state_dict(checkpoint['model'])
             self.optimizer.load_state_dict(checkpoint['optimizer'])
-            self.scaler.load_state_dict(checkpoint['scaler'])
+            
+            # Handle scaler based on precision mode
+            if self.scaler is not None:
+                if 'scaler' not in checkpoint:
+                    logging.warning('No scaler state found in checkpoint, initializing new scaler')
+                else:
+                    self.scaler.load_state_dict(checkpoint['scaler'])
+            elif 'scaler' in checkpoint:
+                logging.warning('Scaler found in checkpoint but training in fp32 mode, skipping scaler loading')
+            
+            # Reset learning rate
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = cfg.lr
+                
+            # Load training status
             results = checkpoint.get('results', dict())
-            self._cur_iter  = checkpoint['iter']
+            self._cur_iter = checkpoint['iter']
             self._cur_epoch = checkpoint['epoch']
             self._best_loss = results.get('loss', self._best_loss)
+            
             logging.info(f'Loaded checkpoint from {ckpt_path}. results={results}, '
-                         f'Epoch={self._cur_epoch}, iterations={self._cur_iter} \n')
+                        f'Epoch={self._cur_epoch}, iterations={self._cur_iter} \n')
+                    
         elif cfg.weights is not None: # (partially or fully) initialize from pretrained weights
             checkpoint = torch.load(cfg.weights, map_location='cpu')
             self.model.load_state_dict(checkpoint['model'], strict=False)
+            
             if cfg.load_optim:
                 self.optimizer.load_state_dict(checkpoint['optimizer'])
-                self.scaler.load_state_dict(checkpoint['scaler'])
+                
+                # Handle scaler based on precision mode 
+                if self.scaler is not None:
+                    if 'scaler' not in checkpoint:
+                        logging.warning('No scaler state found in weights while load_optim=True, initializing new scaler')
+                    else:
+                        self.scaler.load_state_dict(checkpoint['scaler'])
+                elif 'scaler' in checkpoint:
+                    logging.warning('Scaler state found in weights but training is in bf16/fp32 mode, skipping scaler loading')
+                    
+                # Reset learning rate
                 for param_group in self.optimizer.param_groups:
                     param_group['lr'] = cfg.lr
+                    
             logging.info(f'Loaded checkpoint from {cfg.weights}. optimizer={cfg.load_optim}. \n')
         else:
             logging.info('No pre-trained weights provided. Will train from scratch. \n')
-
     def set_wandb(self):
         cfg = self.cfg
+
+        #  Save the original amp_dtype
+        original_dtype = cfg.amp_dtype
 
         # check if there is a previous run to resume
         wbid_path = self._log_dir / 'wandb_id.txt'
         rid = utils.read_file(wbid_path).strip().split('\n')[-1] if wbid_path.is_file() else None
+        
+        # Prepare a copy of config for wandb, convert dtype to string
+        wandb_config = cfg.__dict__.copy()
+        if original_dtype is not None:
+            wandb_config['amp_dtype'] = str(original_dtype)
+        
         # initialize wandb
         run_name = self._log_dir.stem
         if cfg.wbnote is not None:
             run_name = f'{run_name}: {cfg.wbnote}'
         wbrun = wandb.init(
             project=cfg.wbproject, entity=cfg.wbentity, group=cfg.wbgroup, name=run_name, tags=cfg.wbtags,
-            config=cfg, dir='runs/', id=rid, resume='allow', save_code=True, mode=cfg.wbmode
+            config=wandb_config, dir='runs/', id=rid, resume='allow', save_code=True, mode=cfg.wbmode
         )
-        cfg = wbrun.config
+        
+        # Update the config but keep the original dtype.
+        cfg_dict = wbrun.config.as_dict()
+        for k, v in cfg_dict.items():
+            if k != 'amp_dtype':
+                setattr(cfg, k, v)
+        cfg.amp_dtype = original_dtype
+
         cfg.wandb_id = wbrun.id
         utils.print_to_file(wbrun.id, fpath=wbid_path, mode='a')
 
@@ -308,7 +387,7 @@ class BaseTrainingWrapper():
         cfg = self.cfg
 
         if cfg.ema:
-            ema = ModelEmaV2(self.model, decay=cfg.ema_decay)
+            ema = ModelEmaV3(self.model, decay=cfg.ema_decay,use_warmup=True,warmup_power=2/3,foreach=True,device=self.device)
 
             msg = f'Training uses EMA with decay = {cfg.ema_decay}.'
             if cfg.resume:
@@ -358,23 +437,33 @@ class BaseTrainingWrapper():
             # training step
             assert model.training
             batch = next(self.trainloader)
-            with amp.autocast(enabled=cfg.amp):
+            # Use autocast for both bf16 and fp16
+            with amp.autocast('cuda',enabled=cfg.amp_dtype is not None, dtype=cfg.amp_dtype):
                 stats = model(batch)
                 loss = stats['loss'] / float(cfg.accum_num)
-            self.scaler.scale(loss).backward() # gradients are averaged over devices in DDP mode
+
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
             # parameter update (with Gradient Accumulation when cfg.accum_num > 1)
             if step % cfg.accum_num == 0:
-                # https://pytorch.org/docs/stable/notes/amp_examples.html#gradient-clipping
-                self.scaler.unscale_(self.optimizer)
+                if self.scaler is not None:
+                    self.scaler.unscale_(self.optimizer)
+                    
                 _, flag = self.gradient_clip(model.parameters())
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                
+                if self.scaler is not None:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                    
                 self.optimizer.zero_grad()
 
                 if (self.ema is not None) and flag:
-                    _warmup = cfg.ema_warmup or (cfg.iterations // 20)
-                    self.ema.decay = cfg.ema_decay * (1 - math.exp(-step / _warmup))
-                    self.ema.update(model)
+                    self.ema.update(model,step)
 
             # sanity check
             if torch.isnan(loss).any() or torch.isinf(loss).any():
@@ -472,7 +561,7 @@ class BaseTrainingWrapper():
             _log_dic = {
                 'general/lr': self.optimizer.param_groups[0]['lr'],
                 'general/grad_norm': self._moving_grad_norm_buffer.max(),
-                'ema/decay': (self.ema.decay if self.ema else 0)
+                'ema/decay': (self.ema.get_decay(self._cur_iter) if self.ema else 0)
             }
             _log_dic.update(
                 {'train/'+k: self.stats_table[k] for k in self.wandb_log_keys}
@@ -490,29 +579,35 @@ class BaseTrainingWrapper():
             'general/epoch': self._cur_epoch,
             'general/iter':  self._cur_iter
         }
-        model_ = unwrap_model(self.model).eval()
+        model_ = unwrap_model(self.model)
+        model_.eval()
         results = self.eval_model(model_)
+        
         logging.info(f'Validation results (no EMA): {results}')
         utils.print_dict_as_table(results)
         _log_dic.update({'val-metrics/plain_'+k: v for k,v in results.items()})
+        
         # save last checkpoint
         checkpoint = {
             'model'     : model_.state_dict(),
             'optimizer' : self.optimizer.state_dict(),
-            'scaler'    : self.scaler.state_dict(),
-            'epoch': self._cur_epoch,
-            'iter':  self._cur_iter,
+            'epoch'     : self._cur_epoch,
+            'iter'      : self._cur_iter,
             'results'   : results,
         }
+        if self.scaler is not None:
+            checkpoint['scaler'] = self.scaler.state_dict()
+            
         torch.save(checkpoint, self._log_dir / 'last.pt')
         self._save_if_best(checkpoint)
-
+        
+        # EMA evaluation
         if self.cfg.ema:
             results = self.eval_model(self.ema.module.eval())
             logging.info(f'Validation results (EMA): {results}')
             utils.print_dict_as_table(results)
             _log_dic.update({f'val-metrics/ema_'+k: v for k,v in results.items()})
-            # save last checkpoint of EMA
+            
             checkpoint = {
                 'model': self.ema.module.state_dict(),
                 'epoch': self._cur_epoch,
@@ -521,14 +616,13 @@ class BaseTrainingWrapper():
             }
             torch.save(checkpoint, self._log_dir / 'last_ema.pt')
             self._save_if_best(checkpoint)
-
-        # wandb log
+        
+        # Log results
         self.wbrun.log(_log_dic, step=self._cur_iter)
-        # Log evaluation results to file
         msg = self.stats_table.get_body() + '||' + '%10.4g' * 1 % (results['loss'])
         with open(self._log_dir / 'results.txt', 'a') as f:
             f.write(msg + '\n')
-
+        
         self._results = results
         print()
 

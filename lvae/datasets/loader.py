@@ -26,7 +26,7 @@ def make_trainloader(dataset, batch_size: int, workers: int):
         sampler = None
     dataloader = DataLoader(
         dataset, batch_size=batch_size, shuffle=(sampler is None), drop_last=True,
-        num_workers=workers, pin_memory=True, sampler=sampler
+        num_workers=workers, pin_memory=True, sampler=sampler,persistent_workers=True
     )
     generater = _make_generator(dataloader)
     return generater, sampler
